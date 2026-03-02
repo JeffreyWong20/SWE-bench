@@ -42,6 +42,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "gpt-5-mini-2025-08-07": 400_000,
 }
 
 # The cost per token for each model input.
@@ -61,6 +62,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "gpt-5-mini-2025-08-07": 0.00000025,
 }
 
 # The cost per token for each model output.
@@ -80,6 +82,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "gpt-5-mini-2025-08-07": 0.000002,
 }
 
 # used for azure
@@ -145,7 +148,7 @@ def call_chat(model_name_or_path, inputs, use_azure, temperature, top_p, **model
                     {"role": "user", "content": user_message},
                 ],
                 temperature=temperature,
-                top_p=top_p,
+                # top_p=top_p, # --- IGNORE --- seems to cause issues with some models, need to investigate
                 **model_args,
             )
         input_tokens = response.usage.prompt_tokens
@@ -230,6 +233,7 @@ def openai_inference(
                 use_azure,
                 temperature,
                 top_p,
+                **model_args,
             )
             completion = response.choices[0].message.content
             total_cost += cost
@@ -482,6 +486,7 @@ def main(
         raise ValueError(f"Invalid split {split} for dataset {dataset_name_or_path}")
     dataset = dataset[split]
     lens = np.array(list(map(len, dataset["text"])))
+    # lens = 1
     dataset = dataset.select(np.argsort(lens))
     if len(existing_ids) > 0:
         dataset = dataset.filter(
@@ -505,6 +510,13 @@ def main(
         openai_inference(**inference_args)
     else:
         raise ValueError(f"Invalid model name or path {model_name_or_path}")
+    
+    # save inference args for reproducibility
+    with open(output_file.with_suffix(".args.json"), "w") as f:
+        inference_args["test_dataset"] = dataset_name_or_path
+        inference_args["output_file"] = str(output_file)
+        inference_args["existing_ids"] = list(inference_args["existing_ids"])
+        json.dump(inference_args, f, indent=4)
     logger.info("Done!")
 
 
