@@ -9,6 +9,8 @@ import os
 import time
 import dotenv
 import traceback
+import threading
+import concurrent.futures
 from pathlib import Path
 from tqdm.auto import tqdm
 import numpy as np
@@ -184,6 +186,7 @@ def openai_inference(
     model_args,
     existing_ids,
     max_cost,
+    num_workers=4,
 ):
     """
     Runs inference on a dataset using the openai API.
@@ -221,32 +224,51 @@ def openai_inference(
         "model_name_or_path": model_name_or_path,
     }
     total_cost = 0
+    cost_lock = threading.Lock()
+    file_lock = threading.Lock()
+    stop_event = threading.Event()
     print(f"Filtered to {len(test_dataset)} instances")
-    with open(output_file, "a+") as f:
-        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
-            instance_id = datum["instance_id"]
-            if instance_id in existing_ids:
-                continue
-            output_dict = {"instance_id": instance_id}
-            output_dict.update(basic_args)
-            output_dict["text"] = f"{datum['text']}\n\n"
-            response, cost = call_chat(
-                output_dict["model_name_or_path"],
-                output_dict["text"],
-                use_azure,
-                temperature,
-                top_p,
-                **model_args,
-            )
-            completion = response.choices[0].message.content
+
+    def process_datum(datum):
+        nonlocal total_cost
+        if stop_event.is_set():
+            return
+        instance_id = datum["instance_id"]
+        if instance_id in existing_ids:
+            return
+        output_dict = {"instance_id": instance_id}
+        output_dict.update(basic_args)
+        output_dict["text"] = f"{datum['text']}\n\n"
+        result = call_chat(
+            output_dict["model_name_or_path"],
+            output_dict["text"],
+            use_azure,
+            temperature,
+            top_p,
+            **model_args,
+        )
+        if result is None:
+            return
+        response, cost = result
+        completion = response.choices[0].message.content
+        output_dict["full_output"] = completion
+        output_dict["model_patch"] = extract_diff(completion)
+        with cost_lock:
             total_cost += cost
             print(f"Total Cost: {total_cost:.2f}")
-            output_dict["full_output"] = completion
-            output_dict["model_patch"] = extract_diff(completion)
-            print(json.dumps(output_dict), file=f, flush=True)
             if max_cost is not None and total_cost >= max_cost:
                 print(f"Reached max cost {max_cost}, exiting")
-                break
+                stop_event.set()
+        with file_lock:
+            with open(output_file, "a") as f:
+                print(json.dumps(output_dict), file=f, flush=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        list(tqdm(
+            executor.map(process_datum, test_dataset),
+            total=len(test_dataset),
+            desc=f"Inference for {model_name_or_path}",
+        ))
 
 
 @retry(wait=wait_random_exponential(min=60, max=600), stop=stop_after_attempt(6))
@@ -334,6 +356,7 @@ def anthropic_inference(
     model_args,
     existing_ids,
     max_cost,
+    num_workers=4,
 ):
     """
     Runs inference on a dataset using the anthropic API.
@@ -366,49 +389,68 @@ def anthropic_inference(
         "model_name_or_path": model_name_or_path,
     }
     total_cost = 0
+    cost_lock = threading.Lock()
+    file_lock = threading.Lock()
+    stop_event = threading.Event()
     print(f"Filtered to {len(test_dataset)} instances")
     call_api = call_anthropic_v2
     # if "claude-3" in model_name_or_path.lower():
     #     call_api = call_anthropic_v2
     # else:
     #     call_api = call_anthropic
-    with open(output_file, "a+") as f:
-        for datum in tqdm(test_dataset, desc=f"Inference for {model_name_or_path}"):
-            instance_id = datum["instance_id"]
-            if instance_id in existing_ids:
-                continue
-            output_dict = {"instance_id": instance_id}
-            output_dict.update(basic_args)
-            if "claude-3" in model_name_or_path.lower():
-                output_dict["text_inputs"] = f"{datum['text']}\n"
-            else:
-                output_dict["text_inputs"] = (
-                    f"{HUMAN_PROMPT} {datum['text']}\n\n{AI_PROMPT}"
-                )
-            try:
-                completion, cost = call_api(
-                    output_dict["text_inputs"],
-                    anthropic,
-                    model_name_or_path,
-                    temperature,
-                    top_p,
-                    **model_args,
-                )
-            except Exception as e:
-                logger.error(e)
-                traceback.print_exc()
-                continue
+
+    def process_datum(datum):
+        nonlocal total_cost
+        if stop_event.is_set():
+            return
+        instance_id = datum["instance_id"]
+        if instance_id in existing_ids:
+            return
+        output_dict = {"instance_id": instance_id}
+        output_dict.update(basic_args)
+        if "claude-3" in model_name_or_path.lower():
+            output_dict["text_inputs"] = f"{datum['text']}\n"
+        else:
+            output_dict["text_inputs"] = (
+                f"{HUMAN_PROMPT} {datum['text']}\n\n{AI_PROMPT}"
+            )
+        try:
+            result = call_api(
+                output_dict["text_inputs"],
+                anthropic,
+                model_name_or_path,
+                temperature,
+                top_p,
+                **model_args,
+            )
+        except Exception as e:
+            logger.error(e)
+            traceback.print_exc()
+            return
+        if result is None:
+            return
+        completion, cost = result
+        if "claude-3" in model_name_or_path.lower():
+            output_dict["full_output"] = completion.content[0].text
+        else:
+            output_dict["full_output"] = completion.completion
+        output_dict["model_patch"] = extract_diff(output_dict["full_output"])
+        with cost_lock:
             total_cost += cost
             print(f"Total Cost: {total_cost:.2f}")
-            if "claude-3" in model_name_or_path.lower():
-                output_dict["full_output"] = completion.content[0].text
-            else:
-                output_dict["full_output"] = completion.completion
-            output_dict["model_patch"] = extract_diff(output_dict["full_output"])
-            print(json.dumps(output_dict), file=f, flush=True)
             if max_cost is not None and total_cost >= max_cost:
                 print(f"Reached max cost {max_cost}, exiting")
-                break
+                stop_event.set()
+        with file_lock:
+            with open(output_file, "a") as f:
+                print(json.dumps(output_dict), file=f, flush=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        list(tqdm(
+            executor.map(process_datum, test_dataset),
+            total=len(test_dataset),
+            desc=f"Inference for {model_name_or_path}",
+        ))
 
 
 def parse_model_args(model_args):
@@ -456,6 +498,7 @@ def main(
     output_dir,
     model_args,
     max_cost,
+    num_workers=4,
 ):
     if shard_id is None and num_shards is not None:
         logger.warning(
@@ -507,6 +550,7 @@ def main(
         "model_args": model_args,
         "existing_ids": existing_ids,
         "max_cost": max_cost,
+        "num_workers": num_workers,
     }
     if model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
@@ -574,6 +618,12 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="Maximum cost to spend on inference.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for inference.",
     )
     args = parser.parse_args()
     main(**vars(args))
